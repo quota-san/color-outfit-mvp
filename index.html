@@ -6,30 +6,30 @@
   <title>Color Outfit Suggest (MVP)</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial; margin:16px;}
-    video,canvas{width:100%; max-width:520px; border-radius:12px; background:#111;}
+    .wrap{position:relative; width:100%; max-width:520px;}
+    video, canvas.display{width:100%; max-width:520px; border-radius:12px; background:#111; display:block;}
+    canvas.overlay{position:absolute; inset:0; pointer-events:none; border-radius:12px;}
     .row{display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; align-items:center;}
-    .swatch{width:140px; border-radius:12px; padding:10px; border:1px solid #ddd;}
-    .chip{height:48px; border-radius:10px; border:1px solid rgba(0,0,0,.08);}
     button{padding:10px 12px; border-radius:10px; border:1px solid #ccc; background:#fff;}
     select{padding:10px 12px; border-radius:10px; border:1px solid #ccc; background:#fff;}
-    .hint{color:#555; font-size:13px; line-height:1.4;}
+    .hint{color:#555; font-size:13px; line-height:1.4; margin-top:6px;}
     .mini{color:#666; font-size:12px;}
-    .wrap{position:relative; width:100%; max-width:520px;}
-    .overlay{
-      position:absolute; inset:0; pointer-events:none;
-      border-radius:12px;
-    }
+    .swatch{width:140px; border-radius:12px; padding:10px; border:1px solid #ddd;}
+    .chip{height:48px; border-radius:10px; border:1px solid rgba(0,0,0,.08);}
+    .modeBadge{display:inline-block; padding:3px 8px; border-radius:999px; border:1px solid #ddd; font-size:12px; color:#444;}
   </style>
 </head>
 <body>
   <h2>撮影→スポイト色→配色提案（MVP）</h2>
-  <p class="hint">
-    黒い枠（プレビュー）を<b>タップ</b>すると、その地点の周辺色で提案します。<br/>
-    代表色は周辺領域の<b>RGB中央値</b>（反射・影にやや強め）。
-  </p>
+  <div class="hint">
+    ①「カメラ開始」→ライブ表示<br/>
+    ②「撮影」→静止画を表示（その上でタップ＝スポイト）<br/>
+    ③もう一度「撮影」→ライブ表示に戻る（次の撮影準備）
+  </div>
 
   <div class="wrap">
     <video id="v" playsinline autoplay></video>
+    <canvas id="photo" class="display"></canvas>
     <canvas id="mark" class="overlay"></canvas>
   </div>
 
@@ -43,55 +43,146 @@
       <option value="dinner">ディナー</option>
     </select>
 
+    <span id="mode" class="modeBadge">未開始</span>
     <span id="picked" class="mini"></span>
   </div>
 
-  <canvas id="c" width="520" height="520" style="display:none;"></canvas>
   <div id="out" class="row"></div>
 
 <script>
 const v = document.getElementById('v');
-const c = document.getElementById('c');
-const ctx = c.getContext('2d', { willReadFrequently: true });
-
+const photo = document.getElementById('photo');
 const mark = document.getElementById('mark');
-const mctx = mark.getContext('2d');
 
 const out = document.getElementById('out');
 const picked = document.getElementById('picked');
+const modeBadge = document.getElementById('mode');
 const tpoSel = document.getElementById('tpo');
 
-// どれくらいの範囲で色を拾うか（NxN）。20でもOK。偶数だと扱いやすい
+const photoCtx = photo.getContext('2d', { willReadFrequently: true });
+const mctx = mark.getContext('2d');
+
+// どれくらいの範囲で色を拾うか（NxN）
 const SAMPLE_SIZE = 24;
 
-// 最後にユーザーがタップした座標（canvas座標 0..w-1）
+// 表示状態
+// live: video表示（スポイトは効くが、基本は撮影→freeze推奨）
+// freeze: photo canvas表示（スポイト操作の本命）
+let viewMode = "live"; // live | freeze
+let streamRef = null;
+
+let currentTpo = "work";
+tpoSel.value = currentTpo;
+
+// 直近の「ベース色」(RGB) を保持：TPO変更時に“提案色自体”を作り直すため
+let lastBaseRgb = null;
+
+// スポイト位置（photo座標）
 let lastPick = null;
 
 // TPO別：6色の支配率（合計100%）
-// 並びは suggestPalette() の返り値と一致：
-// [0]=Base, [1]=SameA, [2]=SameB, [3]=Comp, [4]=SplitA, [5]=SplitB
-const TPO_PRESETS = {
+const TPO_WEIGHTS = {
   work:   [60, 18, 12,  4,  3,  3],
   casual: [45, 18, 12, 12,  7,  6],
   dinner: [35, 12,  8, 25, 10, 10],
 };
-let currentTpo = "work";
-tpoSel.value = currentTpo;
-tpoSel.addEventListener('change', () => {
-  currentTpo = tpoSel.value;
-  if (window.__lastPalette) renderSwatches(window.__lastPalette);
-});
 
+function setMode(mode){
+  viewMode = mode;
+  if(mode === "live"){
+    v.style.display = "block";
+    photo.style.display = "none";
+    modeBadge.textContent = "ライブ";
+    clearMarker();
+  }else{
+    v.style.display = "none";
+    photo.style.display = "block";
+    modeBadge.textContent = "静止画";
+    // マーカーは維持（lastPickがあれば再描画）
+    if(lastPick) drawMarker(lastPick.x, lastPick.y, photo.width, photo.height);
+  }
+}
+
+// 初期は静止画キャンバスを隠す
+photo.style.display = "none";
+setMode("live");
+
+// カメラ開始
 document.getElementById('start').onclick = async () => {
-  const stream = await navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment" }, audio: false
-  });
-  v.srcObject = stream;
+  try{
+    if(streamRef){
+      // 既に起動済みならそのまま
+      setMode("live");
+      picked.textContent = "カメラは起動済みです。";
+      return;
+    }
+
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "environment" }, audio: false
+    });
+    streamRef = stream;
+    v.srcObject = stream;
+
+    // iOS対策：明示 play
+    await v.play();
+
+    setMode("live");
+    picked.textContent = "カメラ起動中。撮影で静止画に固定できます。";
+  }catch(err){
+    picked.textContent = "カメラ開始に失敗: " + (err?.name ?? err);
+    console.error(err);
+  }
 };
 
+// 撮影ボタン：live→freeze(撮影) / freeze→live(戻る)
+document.getElementById('snap').onclick = () => {
+  if(!streamRef){
+    picked.textContent = "先に「カメラ開始」を押してください。";
+    return;
+  }
+
+  if(viewMode === "live"){
+    // 撮影して静止画へ
+    const info = drawVideoToPhotoSquare(520);
+    if(!info) return;
+
+    setMode("freeze");
+
+    // 未タップなら中心を採用して提案しておく
+    const x = lastPick ? lastPick.x : Math.floor(photo.width/2);
+    const y = lastPick ? lastPick.y : Math.floor(photo.height/2);
+    lastPick = {x, y};
+
+    const base = medianColorAt(photoCtx, x, y, SAMPLE_SIZE, photo.width, photo.height);
+    lastBaseRgb = base;
+    const hex = rgbToHex(...base);
+
+    picked.textContent = `採用: (${x},${y}) 周辺${SAMPLE_SIZE}×${SAMPLE_SIZE} 中央値 ${hex}`;
+    drawMarker(x, y, photo.width, photo.height);
+
+    const palette = suggestPalette(base, currentTpo);
+    renderSwatches(palette, currentTpo);
+  }else{
+    // 静止画をやめてライブへ戻る
+    setMode("live");
+    picked.textContent = "ライブに戻りました。構図を決めて「撮影」で固定できます。";
+  }
+};
+
+// TPO変更：提案色そのものを作り直す
+tpoSel.addEventListener('change', () => {
+  currentTpo = tpoSel.value;
+
+  if(lastBaseRgb){
+    const palette = suggestPalette(lastBaseRgb, currentTpo);
+    renderSwatches(palette, currentTpo);
+    picked.textContent = (picked.textContent || "") + "（TPOで提案色を更新）";
+  }
+}, {passive:true});
+
+// ========== 色変換 ==========
 function clamp01(x){ return Math.max(0, Math.min(1, x)); }
 
-// sRGB <-> HSL（簡易）
 function rgbToHsl(r,g,b){
   r/=255; g/=255; b/=255;
   const max=Math.max(r,g,b), min=Math.min(r,g,b);
@@ -119,84 +210,96 @@ function hslToRgb(h,s,l){
   else if(180<=h && h<240){ g1=X; b1=C; }
   else if(240<=h && h<300){ r1=X; b1=C; }
   else { r1=C; b1=X; }
-  const r=Math.round((r1+m)*255), g=Math.round((g1+m)*255), b=Math.round((b1+m)*255);
-  return [r,g,b];
+  return [
+    Math.round((r1+m)*255),
+    Math.round((g1+m)*255),
+    Math.round((b1+m)*255)
+  ];
 }
 function rgbToHex(r,g,b){
   return "#" + [r,g,b].map(x=>x.toString(16).padStart(2,"0")).join("");
 }
 
-// 領域NxNのRGB「中央値」で代表色を求める（反射/影に少し強い）
-function medianColorAt(x, y, n, imgW, imgH){
+// ========== スポイト（中央値） ==========
+function medianColorAt(ctx2d, x, y, n, imgW, imgH){
   const half = Math.floor(n/2);
-
   const left = Math.max(0, x - half);
   const top  = Math.max(0, y - half);
   const right = Math.min(imgW, x + half);
   const bottom = Math.min(imgH, y + half);
-
   const w = Math.max(1, right - left);
   const h = Math.max(1, bottom - top);
 
-  const data = ctx.getImageData(left, top, w, h).data;
-
-  const rs = [];
-  const gs = [];
-  const bs = [];
-
+  const data = ctx2d.getImageData(left, top, w, h).data;
+  const rs=[], gs=[], bs=[];
   for(let i=0;i<data.length;i+=4){
     const a = data[i+3];
     if(a < 230) continue;
-    rs.push(data[i]);
-    gs.push(data[i+1]);
-    bs.push(data[i+2]);
+    rs.push(data[i]); gs.push(data[i+1]); bs.push(data[i+2]);
   }
-
-  if(rs.length === 0) return [128,128,128];
-
-  rs.sort((a,b)=>a-b);
-  gs.sort((a,b)=>a-b);
-  bs.sort((a,b)=>a-b);
+  if(rs.length===0) return [128,128,128];
+  rs.sort((a,b)=>a-b); gs.sort((a,b)=>a-b); bs.sort((a,b)=>a-b);
   const mid = Math.floor(rs.length/2);
   return [rs[mid], gs[mid], bs[mid]];
 }
 
-// 配色候補：同系色 / 差し色（補色） / 分割補色
-function suggestPalette(baseRgb){
-  const [h,s,l] = rgbToHsl(...baseRgb);
+// ========== 提案色生成（TPOで色自体を変える） ==========
+function suggestPalette(baseRgb, tpo){
+  const [h0,s0,l0] = rgbToHsl(...baseRgb);
 
-  // 同系（左右）
-  const same1 = [ (h+20)%360, s, l ];
-  const same2 = [ (h+340)%360, s, l ];
+  // TPOで “色相の飛ばし方” と “彩度/明度の寄せ方” を変える
+  // 6色構成は固定：Base / Var1 / Var2 / Var3 / Var4 / Var5
+  // 仕事：同系中心＋穏やか（補色はかなり弱め）
+  // 休日：同系＋補色＋分割（バランス）
+  // ディナー：強めコントラスト（補色・トライアド寄りを増やす）
+  let offsets, sMul, lBias;
+  if(tpo === "work"){
+    offsets = [0, +18, -18, +150, +165, +195]; // 補色を避けて“分割寄り”にする
+    sMul = 0.70; lBias = 0.00;
+  }else if(tpo === "casual"){
+    offsets = [0, +20, -20, +180, +150, +210]; // 王道：補色＋分割補色
+    sMul = 0.90; lBias = 0.02;
+  }else{ // dinner
+    offsets = [0, +30, -30, +180, +120, +240]; // 補色＋トライアド（夜は映える）
+    sMul = 1.05; lBias = -0.03;
+  }
 
-  // 補色
-  const comp  = [ (h+180)%360, s, l ];
+  const mk = (label, hh, ss, ll) => {
+    const rgb = hslToRgb((hh+360)%360, clamp01(ss), clamp01(ll));
+    return {label, rgb, hex: rgbToHex(...rgb)};
+  };
 
-  // 分割補色
-  const split1 = [ (h+150)%360, s, l ];
-  const split2 = [ (h+210)%360, s, l ];
+  // Baseはそのまま（ただしディナーは少し締める/仕事は少し落ち着かせる、なども可能）
+  const base = mk("Base（拾った色）", h0, s0, l0);
 
-  return [
-    {label:"Base（拾った色）", hsl:[h,s,l]},
-    {label:"同系色A", hsl:same1},
-    {label:"同系色B", hsl:same2},
-    {label:"補色",   hsl:comp},
-    {label:"分割補色A", hsl:split1},
-    {label:"分割補色B", hsl:split2},
-  ].map(x=>{
-    const rgb = hslToRgb(...x.hsl);
-    return {...x, rgb, hex: rgbToHex(...rgb)};
-  });
+  // バリエーション生成：彩度をTPOで寄せる + ちょい明度バイアス
+  const s = clamp01(s0 * sMul);
+  const l = clamp01(l0 + lBias);
+
+  const v1 = mk("提案1", h0 + offsets[1], s, l);
+  const v2 = mk("提案2", h0 + offsets[2], s, l);
+
+  // 強い色は扱いが難しいので、仕事は特に彩度を落とす／ディナーは少し上げる
+  const accentS = (tpo==="work") ? clamp01(Math.max(s0*0.55, 0.25)) :
+                  (tpo==="dinner") ? clamp01(Math.max(s0*1.10, 0.50)) :
+                                     clamp01(Math.max(s0*0.95, 0.40));
+  const accentL = (tpo==="dinner") ? clamp01(Math.min(l0+0.05, 0.62)) :
+                  (tpo==="work") ? clamp01(Math.min(l0+0.02, 0.60)) :
+                                   clamp01(Math.min(l0+0.04, 0.62));
+
+  const v3 = mk("提案3（対比）", h0 + offsets[3], accentS, accentL);
+  const v4 = mk("提案4（対比）", h0 + offsets[4], accentS, accentL);
+  const v5 = mk("提案5（対比）", h0 + offsets[5], accentS, accentL);
+
+  return [base, v1, v2, v3, v4, v5];
 }
 
-function renderSwatches(items){
-  window.__lastPalette = items;
-  const weights = TPO_PRESETS[currentTpo] ?? TPO_PRESETS.work;
+function renderSwatches(items, tpo){
+  const weights = TPO_WEIGHTS[tpo] ?? TPO_WEIGHTS.work;
 
   out.innerHTML = "";
   items.forEach((it, idx) => {
     const w = weights[idx] ?? 0;
-
     const div = document.createElement('div');
     div.className = "swatch";
     div.innerHTML = `
@@ -210,19 +313,53 @@ function renderSwatches(items){
   });
 }
 
-// マーカー描画（十字＋サンプル枠）
-function drawMarker(x, y, w, h){
-  // overlay canvas を video と同じ表示サイズに合わせる
-  const rect = v.getBoundingClientRect();
-  mark.width = Math.round(rect.width * devicePixelRatio);
-  mark.height = Math.round(rect.height * devicePixelRatio);
+// ========== 描画：video→photoへ撮影（正方形） ==========
+function drawVideoToPhotoSquare(targetSize=520){
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if(!vw || !vh){
+    picked.textContent = "カメラの準備中です（数秒待って再度）。";
+    return null;
+  }
+  photo.width = targetSize;
+  photo.height = targetSize;
+
+  const side = Math.min(vw, vh);
+  const sx = Math.floor(vw/2 - side/2);
+  const sy = Math.floor(vh/2 - side/2);
+
+  photoCtx.drawImage(v, sx, sy, side, side, 0, 0, targetSize, targetSize);
+  return {w: targetSize, h: targetSize};
+}
+
+// ========== マーカー ==========
+function clearMarker(){
+  resizeOverlayToMatchDisplay();
+  const rect = getDisplayRect();
+  mctx.clearRect(0,0,rect.w,rect.h);
+}
+
+function getDisplayRect(){
+  // いま見えている表示要素（video or photo）の表示サイズ
+  const el = (viewMode === "freeze") ? photo : v;
+  const r = el.getBoundingClientRect();
+  return {w: r.width, h: r.height};
+}
+
+function resizeOverlayToMatchDisplay(){
+  const rect = getDisplayRect();
+  mark.width = Math.round(rect.w * devicePixelRatio);
+  mark.height = Math.round(rect.h * devicePixelRatio);
   mctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+}
 
-  mctx.clearRect(0,0,rect.width,rect.height);
+function drawMarker(x, y, w, h){
+  resizeOverlayToMatchDisplay();
+  const rect = getDisplayRect();
 
-  // video表示座標へ変換
-  const px = (x / w) * rect.width;
-  const py = (y / h) * rect.height;
+  mctx.clearRect(0,0,rect.w,rect.h);
+
+  const px = (x / w) * rect.w;
+  const py = (y / h) * rect.h;
 
   // 十字
   mctx.lineWidth = 2;
@@ -232,112 +369,46 @@ function drawMarker(x, y, w, h){
   mctx.moveTo(px, py-12); mctx.lineTo(px, py+12);
   mctx.stroke();
 
-  // サンプル枠（N×Nを表示比に換算した大きさ）
-  const boxW = (SAMPLE_SIZE / w) * rect.width;
-  const boxH = (SAMPLE_SIZE / h) * rect.height;
-
+  // サンプル枠
+  const boxW = (SAMPLE_SIZE / w) * rect.w;
+  const boxH = (SAMPLE_SIZE / h) * rect.h;
   mctx.strokeStyle = "rgba(255,255,255,0.6)";
   mctx.lineWidth = 1.5;
   mctx.strokeRect(px - boxW/2, py - boxH/2, boxW, boxH);
 }
 
-// videoの現在フレームを canvas に正方形で描画
-function drawVideoToCanvasSquare(targetSize=520){
-  const vw = v.videoWidth, vh = v.videoHeight;
-  if(!vw || !vh) return null;
+// ========== スポイト：静止画上でタップ（pointerdown一本化） ==========
+photo.addEventListener('pointerdown', (e) => {
+  if(viewMode !== "freeze") return;
 
-  c.width = targetSize;
-  c.height = targetSize;
+  const rect = photo.getBoundingClientRect();
+  const rx = clamp01((e.clientX - rect.left) / rect.width);
+  const ry = clamp01((e.clientY - rect.top) / rect.height);
 
-  const side = Math.min(vw, vh);
-  const sx = Math.floor(vw/2 - side/2);
-  const sy = Math.floor(vh/2 - side/2);
-
-  ctx.drawImage(v, sx, sy, side, side, 0, 0, targetSize, targetSize);
-  return {w: targetSize, h: targetSize};
-}
-
-// タップでスポイト位置を決める
-v.addEventListener('click', () => {
-  // いま表示されているフレームを一度canvasへ描いて、座標系を統一
-  const info = drawVideoToCanvasSquare(520);
-  if(!info) return;
-
-  const rect = v.getBoundingClientRect();
-  const evt = window.event;
-  const clientX = evt.clientX ?? 0;
-  const clientY = evt.clientY ?? 0;
-
-  const rx = clamp01((clientX - rect.left) / rect.width);
-  const ry = clamp01((clientY - rect.top) / rect.height);
-
-  const x = Math.round(rx * (info.w - 1));
-  const y = Math.round(ry * (info.h - 1));
+  const x = Math.round(rx * (photo.width - 1));
+  const y = Math.round(ry * (photo.height - 1));
 
   lastPick = {x, y};
 
-  const base = medianColorAt(x, y, SAMPLE_SIZE, info.w, info.h);
+  const base = medianColorAt(photoCtx, x, y, SAMPLE_SIZE, photo.width, photo.height);
+  lastBaseRgb = base;
+
   const hex = rgbToHex(...base);
-  picked.textContent = `スポイト: (${x},${y})  周辺${SAMPLE_SIZE}×${SAMPLE_SIZE} 中央値 ${hex}`;
+  picked.textContent = `スポイト: (${x},${y}) 周辺${SAMPLE_SIZE}×${SAMPLE_SIZE} 中央値 ${hex}`;
 
-  drawMarker(x, y, info.w, info.h);
+  drawMarker(x, y, photo.width, photo.height);
 
-  const palette = suggestPalette(base);
-  renderSwatches(palette);
+  const palette = suggestPalette(base, currentTpo);
+  renderSwatches(palette, currentTpo);
 }, {passive:true});
 
-// iOSで click が取りにくい場合の保険（touch）
-v.addEventListener('touchend', (e) => {
-  if(!e.changedTouches || e.changedTouches.length === 0) return;
-  const t = e.changedTouches[0];
-
-  const info = drawVideoToCanvasSquare(520);
-  if(!info) return;
-
-  const rect = v.getBoundingClientRect();
-  const rx = clamp01((t.clientX - rect.left) / rect.width);
-  const ry = clamp01((t.clientY - rect.top) / rect.height);
-
-  const x = Math.round(rx * (info.w - 1));
-  const y = Math.round(ry * (info.h - 1));
-
-  lastPick = {x, y};
-
-  const base = medianColorAt(x, y, SAMPLE_SIZE, info.w, info.h);
-  const hex = rgbToHex(...base);
-  picked.textContent = `スポイト: (${x},${y})  周辺${SAMPLE_SIZE}×${SAMPLE_SIZE} 中央値 ${hex}`;
-
-  drawMarker(x, y, info.w, info.h);
-
-  const palette = suggestPalette(base);
-  renderSwatches(palette);
-}, {passive:true});
-
-// 撮影ボタン：最後のスポイト位置（なければ中心）で色を拾う
-document.getElementById('snap').onclick = () => {
-  const info = drawVideoToCanvasSquare(520);
-  if(!info) return;
-
-  const x = lastPick ? lastPick.x : Math.floor(info.w/2);
-  const y = lastPick ? lastPick.y : Math.floor(info.h/2);
-
-  const base = medianColorAt(x, y, SAMPLE_SIZE, info.w, info.h);
-  const hex = rgbToHex(...base);
-
-  picked.textContent = `採用: (${x},${y})  周辺${SAMPLE_SIZE}×${SAMPLE_SIZE} 中央値 ${hex}`;
-  drawMarker(x, y, info.w, info.h);
-
-  const palette = suggestPalette(base);
-  renderSwatches(palette);
-};
-
-// リサイズ時にマーカーがズレるのを軽減（最後の座標で描き直し）
+// リサイズでマーカーずれ対策
 window.addEventListener('resize', () => {
-  if(!lastPick) return;
-  // 直近フレームがないと描けないので、snap相当で再描画
-  const info = drawVideoToCanvasSquare(520);
-  if(!info) return;
-  drawMarker(lastPick.x, lastPick.y, info.w, info.h);
+  if(viewMode === "freeze" && lastPick){
+    drawMarker(lastPick.x, lastPick.y, photo.width, photo.height);
+  }else{
+    clearMarker();
+  }
 }, {passive:true});
 </script>
 </body>
